@@ -7,10 +7,10 @@
 <div align="center">
 
 [![GitHub contributors](https://img.shields.io/github/contributors/Garretqaq/docker-proxy)](https://github.com/Garretqaq/docker-proxy/graphs/contributors)
-[![GitHub Issues](https://img.shields.io/github/issues/dqzboy/Docker-Proxy.svg)](https://github.com/dqzboy/Docker-Proxy/issues)
-[![GitHub Pull Requests](https://img.shields.io/github/stars/dqzboy/Docker-Proxy)](https://github.com/dqzboy/Docker-Proxy)
-[![HitCount](https://views.whatilearened.today/views/github/dqzboy/Docker-Proxy.svg)](https://github.com/dqzboy/Docker-Proxy)
-[![GitHub license](https://img.shields.io/github/license/dqzboy/Docker-Proxy)](https://github.com/dqzboy/Docker-Proxy/blob/main/LICENSE)
+[![GitHub Issues](https://img.shields.io/github/issues/dqzboy/Docker-Proxy.svg)](https://github.com/Garretqaq/docker-proxy/issues)
+[![GitHub Pull Requests](https://img.shields.io/github/stars/dqzboy/Docker-Proxy)](https://github.com/Garretqaq/docker-proxy)
+[![HitCount](https://views.whatilearened.today/views/github/dqzboy/Docker-Proxy.svg)](https://github.com/Garretqaq/docker-proxy)
+[![GitHub license](https://img.shields.io/github/license/dqzboy/Docker-Proxy)](https://github.com/Garretqaq/docker-proxy/blob/main/LICENSE)
 
 ---
 
