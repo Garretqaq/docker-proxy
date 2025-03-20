@@ -307,15 +307,18 @@ Commercial support is available at
 func (dp *dockerProxy) handleTokenRequest(w http.ResponseWriter, r *http.Request) {
 	// 修改scope参数中的repository名称
 	q := r.URL.Query()
-	if scope := q.Get("scope"); scope != "" {
+	scope := q.Get("scope")
+	service := q.Get("service")
+
+	if scope != "" {
 		// 如果scope包含repository:，需要处理repository名称
 		if strings.Contains(scope, "repository:") {
 			parts := strings.Split(scope, ":")
 			if len(parts) >= 2 {
 				repoPath := strings.Split(parts[1], "/")
-				// 如果不是library开头，直接使用完整路径
-				if len(repoPath) > 0 && repoPath[0] != "library" {
-					newScope := fmt.Sprintf("repository:%s:%s", strings.Join(repoPath, "/"), parts[len(parts)-1])
+				// 如果不是library开头且只有一个部分，添加library前缀
+				if len(repoPath) == 1 {
+					newScope := fmt.Sprintf("repository:library/%s:%s", repoPath[0], parts[len(parts)-1])
 					q.Set("scope", newScope)
 					r.URL.RawQuery = q.Encode()
 				}
@@ -323,7 +326,13 @@ func (dp *dockerProxy) handleTokenRequest(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	tokenURL := authURL + r.URL.Path + "?" + r.URL.RawQuery
+	tokenURL := authURL + "/token"
+	if service == "" {
+		q.Set("service", "registry.docker.io")
+	}
+
+	tokenURL = tokenURL + "?" + q.Encode()
+	log.Printf("Token请求URL: %s", tokenURL)
 
 	req, err := http.NewRequest(r.Method, tokenURL, nil)
 	if err != nil {
@@ -331,14 +340,20 @@ func (dp *dockerProxy) handleTokenRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// 复制请求头
-	req.Header = r.Header.Clone()
+	// 复制认证头
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+
+	// 设置基本请求头
+	req.Header.Set("User-Agent", r.UserAgent())
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Host", "auth.docker.io")
 
 	// 发送请求
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := dp.client.Do(req)
 	if err != nil {
+		log.Printf("获取token失败: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -348,10 +363,17 @@ func (dp *dockerProxy) handleTokenRequest(w http.ResponseWriter, r *http.Request
 	for k, v := range resp.Header {
 		w.Header()[k] = v
 	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization")
+	w.Header().Set("Access-Control-Expose-Headers", "*")
+
+	// 设置响应状态码
 	w.WriteHeader(resp.StatusCode)
 
 	// 复制响应体
-	io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("复制响应体失败: %v", err)
+	}
 }
 
 func main() {
