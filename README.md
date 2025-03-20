@@ -7,12 +7,12 @@
 <div align="center">
 
 [![GitHub contributors](https://img.shields.io/github/contributors/Garretqaq/docker-proxy)](https://github.com/Garretqaq/docker-proxy/graphs/contributors)
-[![GitHub Issues](https://img.shields.io/github/issues/dqzboy/Docker-Proxy.svg)](https://github.com/dqzboy/Docker-Proxy/issues)
-[![GitHub Pull Requests](https://img.shields.io/github/stars/dqzboy/Docker-Proxy)](https://github.com/dqzboy/Docker-Proxy)
-[![HitCount](https://views.whatilearened.today/views/github/dqzboy/Docker-Proxy.svg)](https://github.com/dqzboy/Docker-Proxy)
-[![GitHub license](https://img.shields.io/github/license/dqzboy/Docker-Proxy)](https://github.com/dqzboy/Docker-Proxy/blob/main/LICENSE)
+[![GitHub Issues](https://img.shields.io/github/issues/Garretqaq/docker-proxy.svg)](https://github.com/Garretqaq/docker-proxy/issues)
+[![GitHub Pull Requests](https://img.shields.io/github/stars/Garretqaq/docker-proxy)](https://github.com/Garretqaq/docker-proxy)
+[![HitCount](https://views.whatilearened.today/views/github/Garretqaq/docker-proxy.svg)](https://github.com/Garretqaq/docker-proxy)
+[![GitHub license](https://img.shields.io/github/license/Garretqaq/docker-proxy)](https://github.com/Garretqaq/docker-proxy/blob/main/LICENSE)
+</div>
 
----
 
 ## ✨ 开发原因
 
@@ -78,7 +78,7 @@ docker logs -f [容器ID或名称]
 
 #### 配置caddy   [安装文档](https://caddy2.dengxiaolong.com/docs/install)
 
-**1.** **修改Caddyfile,增加配置**
+**1.** **修改/etc/caddy/Caddyfile,增加配置**
 
 ```sh
 
@@ -161,6 +161,12 @@ sudo nginx -s reload
 
 > **说明：** 配置了`daemon.json`之后，现在拉取镜像无需指定你的加速地址，直接执行`docker pull`拉取你需要的镜像即可。下面的步骤是你在没有配置`daemon.json`的时候，拉取镜像需要加上你的加速地址才可以正常拉取。
 
+**3. 重启docker生效**
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+```
 ---
 
 ** 使用自建的 Registry 地址替换官方的 Registry 地址拉取镜像**
