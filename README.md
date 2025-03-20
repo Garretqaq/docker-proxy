@@ -44,7 +44,7 @@
 
 ### 通过二进制脚本部署
 
-**1.** 下载对应平台的二进制文件
+**1.** 下载对应平台的二进制文件 [下载](https://github.com/Garretqaq/docker-proxy/releases)
 
 **2.** 运行服务 (Linux amd64为例)
 
