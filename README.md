@@ -161,6 +161,12 @@ sudo nginx -s reload
 
 > **说明：** 配置了`daemon.json`之后，现在拉取镜像无需指定你的加速地址，直接执行`docker pull`拉取你需要的镜像即可。下面的步骤是你在没有配置`daemon.json`的时候，拉取镜像需要加上你的加速地址才可以正常拉取。
 
+**3. 重启docker生效**
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+```
 ---
 
 ** 使用自建的 Registry 地址替换官方的 Registry 地址拉取镜像**
