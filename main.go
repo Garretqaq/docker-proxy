@@ -137,15 +137,7 @@ func (dp *dockerProxy) handleRegistryRequest(w http.ResponseWriter, r *http.Requ
 			log.Printf("处理范围请求: %s", req.Header.Get("Range"))
 		}
 
-		if isDefaultHub {
-			path := req.URL.Path
-			if strings.HasPrefix(path, "/v2/") && !strings.HasPrefix(path, "/v2/library/") {
-				parts := strings.Split(path[4:], "/")
-				if len(parts) > 0 && !strings.Contains(parts[0], "/") {
-					req.URL.Path = "/v2/library/" + strings.Join(parts, "/")
-				}
-			}
-		}
+		// 保持原始路径，不自动添加 library 前缀
 		log.Printf("代理请求到: %s%s", req.Host, req.URL.Path)
 	}
 
