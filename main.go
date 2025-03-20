@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bufio"
+	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -13,8 +16,12 @@ import (
 )
 
 const (
-	defaultHubHost = "registry-1.docker.io"
-	authURL        = "https://auth.docker.io"
+	defaultHubHost   = "registry-1.docker.io"
+	authURL          = "https://auth.docker.io"
+	defaultChunkSize = 5 * 1024 * 1024 // 5MB
+	maxConcurrent    = 3               // 降低最大并发数
+	maxRetries       = 3               // 最大重试次数
+	retryDelay       = 2 * time.Second // 重试延迟
 )
 
 var (
@@ -49,12 +56,24 @@ type dockerProxy struct {
 func newDockerProxy() *dockerProxy {
 	return &dockerProxy{
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 600 * time.Second,
 			Transport: &http.Transport{
-				TLSHandshakeTimeout: 10 * time.Second,
-				IdleConnTimeout:     30 * time.Second,
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 60 * time.Second,
+					DualStack: true,
+				}).DialContext,
+				ForceAttemptHTTP2:     false, // 禁用 HTTP/2
+				MaxIdleConns:          1000,
+				MaxIdleConnsPerHost:   100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   20 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				MaxConnsPerHost:       0,
+				WriteBufferSize:       64 * 1024,
+				ReadBufferSize:        64 * 1024,
 			},
 		},
 	}
@@ -124,7 +143,6 @@ func (dp *dockerProxy) handleRegistryRequest(w http.ResponseWriter, r *http.Requ
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
 	}
 
 	proxy.Director = func(req *http.Request) {
@@ -163,47 +181,273 @@ func (dp *dockerProxy) handleRegistryRequest(w http.ResponseWriter, r *http.Requ
 	proxy.ServeHTTP(w, r)
 }
 
+// 分片信息
+type chunk struct {
+	start int64
+	end   int64
+	index int
+}
+
 // 处理大文件传输的方法
 func (dp *dockerProxy) handleBlobRequest(w http.ResponseWriter, r *http.Request, upstreamHost string) {
+	// 检测客户端连接状态
+	ctx := r.Context()
+
+	// 创建一个可取消的context
+	downloadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// 监听客户端断开
+	go func() {
+		select {
+		case <-ctx.Done():
+			log.Printf("客户端断开连接，取消下载")
+			cancel()
+		case <-downloadCtx.Done():
+			return
+		}
+	}()
+
 	upstreamURL := fmt.Sprintf("https://%s%s", upstreamHost, r.URL.Path)
 	if r.URL.RawQuery != "" {
 		upstreamURL += "?" + r.URL.RawQuery
 	}
 
-	// 创建上游请求
-	upstreamReq, err := http.NewRequest(r.Method, upstreamURL, nil)
+	// 先发送 HEAD 请求获取文件大小
+	headReq, _ := http.NewRequestWithContext(downloadCtx, "HEAD", upstreamURL, nil)
+	headReq.Header = r.Header.Clone()
+	headReq.Header.Set("Host", upstreamHost)
+	headReq.Header.Set("Connection", "keep-alive")
+
+	headResp, err := dp.client.Do(headReq)
+	if err != nil {
+		if downloadCtx.Err() != nil {
+			log.Printf("HEAD请求取消: %v", err)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	headResp.Body.Close()
+
+	contentLength := headResp.ContentLength
+	if contentLength <= 0 {
+		// 如果无法获取文件大小或文件太小，使用普通下载
+		dp.handleSimpleDownload(w, r, upstreamURL, upstreamHost)
+		return
+	}
+
+	// 计算分片
+	chunks := make([]chunk, 0)
+	var current int64 = 0
+	for current < contentLength {
+		end := current + defaultChunkSize
+		if end > contentLength {
+			end = contentLength
+		}
+		chunks = append(chunks, chunk{
+			start: current,
+			end:   end - 1,
+			index: len(chunks),
+		})
+		current = end
+	}
+
+	// 复制响应头
+	for k, v := range headResp.Header {
+		w.Header()[k] = v
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Expose-Headers", "*")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
+	w.Header().Set("Connection", "keep-alive")
+
+	// 设置响应状态码
+	w.WriteHeader(http.StatusOK)
+
+	// 创建带缓冲的writer
+	bufWriter := bufio.NewWriterSize(w, 512*1024) // 512KB buffer
+	defer bufWriter.Flush()
+
+	// 并发下载
+	errChan := make(chan error, len(chunks))
+	doneChan := make(chan struct{})
+	semaphore := make(chan struct{}, maxConcurrent)
+	dataChan := make(chan struct {
+		data  []byte
+		index int
+	}, len(chunks))
+
+	// 启动下载协程
+	for _, c := range chunks {
+		select {
+		case <-downloadCtx.Done():
+			log.Printf("下载已取消")
+			return
+		default:
+			semaphore <- struct{}{} // 获取信号量
+			go func(c chunk) {
+				defer func() { <-semaphore }() // 释放信号量
+
+				select {
+				case <-downloadCtx.Done():
+					errChan <- fmt.Errorf("分片 %d 下载取消", c.index)
+					return
+				default:
+					var lastErr error
+					for retry := 0; retry < maxRetries; retry++ {
+						if retry > 0 {
+							log.Printf("分片 %d 重试 %d/%d", c.index, retry, maxRetries)
+							time.Sleep(retryDelay)
+						}
+
+						req, _ := http.NewRequestWithContext(downloadCtx, "GET", upstreamURL, nil)
+						req.Header = r.Header.Clone()
+						req.Header.Set("Host", upstreamHost)
+						req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", c.start, c.end))
+						req.Header.Set("Connection", "keep-alive")
+
+						resp, err := dp.client.Do(req)
+						if err != nil {
+							lastErr = err
+							if downloadCtx.Err() != nil {
+								errChan <- fmt.Errorf("分片 %d 下载取消", c.index)
+								return
+							}
+							continue
+						}
+
+						// 读取整个分片数据
+						data, err := io.ReadAll(resp.Body)
+						resp.Body.Close()
+
+						if err != nil {
+							lastErr = err
+							if downloadCtx.Err() != nil {
+								errChan <- fmt.Errorf("分片 %d 传输取消", c.index)
+								return
+							}
+							continue
+						}
+
+						// 发送数据到通道
+						dataChan <- struct {
+							data  []byte
+							index int
+						}{data: data, index: c.index}
+
+						errChan <- nil
+						return
+					}
+
+					if lastErr != nil {
+						errChan <- fmt.Errorf("分片 %d 下载失败(重试%d次): %v", c.index, maxRetries, lastErr)
+					}
+				}
+			}(c)
+		}
+	}
+
+	// 按顺序写入数据
+	go func() {
+		receivedChunks := make(map[int][]byte)
+		nextIndex := 0
+		receivedCount := 0
+
+		for receivedCount < len(chunks) {
+			select {
+			case <-downloadCtx.Done():
+				return
+			case chunkData := <-dataChan:
+				receivedChunks[chunkData.index] = chunkData.data
+				receivedCount++
+
+				// 按顺序写入数据
+				for {
+					if data, ok := receivedChunks[nextIndex]; ok {
+						if _, err := bufWriter.Write(data); err != nil {
+							log.Printf("写入数据块 %d 失败: %v", nextIndex, err)
+							return
+						}
+						delete(receivedChunks, nextIndex)
+						nextIndex++
+					} else {
+						break
+					}
+				}
+			}
+		}
+		close(doneChan)
+	}()
+
+	// 等待下载完成或取消
+	select {
+	case <-downloadCtx.Done():
+		log.Printf("下载已取消")
+		return
+	case <-doneChan:
+	}
+}
+
+// 进度读取器
+type progressReader struct {
+	reader     io.Reader
+	total      int64
+	onProgress func(int64)
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.reader.Read(p)
+	if n > 0 {
+		pr.onProgress(int64(n))
+	}
+	return n, err
+}
+
+// 处理简单下载
+func (dp *dockerProxy) handleSimpleDownload(w http.ResponseWriter, r *http.Request, upstreamURL string, upstreamHost string) {
+	req, err := http.NewRequest(r.Method, upstreamURL, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// 复制原始请求头
-	upstreamReq.Header = r.Header.Clone()
-	upstreamReq.Header.Set("Host", upstreamHost)
+	req.Header = r.Header.Clone()
+	req.Header.Set("Host", upstreamHost)
+	req.Header.Set("Accept-Encoding", "gzip")
 
-	// 发送请求
-	resp, err := dp.client.Do(upstreamReq)
+	resp, err := dp.client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	// 复制响应头
 	for k, v := range resp.Header {
 		w.Header()[k] = v
 	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Expose-Headers", "*")
 
-	// 设置响应状态码
 	w.WriteHeader(resp.StatusCode)
 
-	// 使用大缓冲区进行流式传输
-	buf := make([]byte, 32*1024) // 32KB 缓冲区
-	if _, err := io.CopyBuffer(w, resp.Body, buf); err != nil {
+	bufWriter := bufio.NewWriterSize(w, 512*1024)
+	defer bufWriter.Flush()
+
+	var reader io.Reader = resp.Body
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		gzReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			log.Printf("创建gzip reader失败: %v", err)
+			return
+		}
+		defer gzReader.Close()
+		reader = gzReader
+	}
+
+	buf := make([]byte, 256*1024)
+	if _, err := io.CopyBuffer(bufWriter, reader, buf); err != nil {
 		log.Printf("传输数据时发生错误: %v", err)
-		return
 	}
 }
 
@@ -372,12 +616,11 @@ func main() {
 	proxy := newDockerProxy()
 
 	server := &http.Server{
-		Addr:    ":9000",
-		Handler: proxy,
-		// 增加服务器超时设置/songguangzhi/yolo/blobs/sha256:7cf63256a31a4cc44f6defe8e1af95363aee5fa75f30a248d95cae684f87c53c
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   30 * time.Second,
-		IdleTimeout:    60 * time.Second,
+		Addr:           ":9000",
+		Handler:        proxy,
+		ReadTimeout:    600 * time.Second,
+		WriteTimeout:   600 * time.Second,
+		IdleTimeout:    120 * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
 
