@@ -78,7 +78,7 @@ docker logs -f [容器ID或名称]
 
 #### 配置caddy   [安装文档](https://caddy2.dengxiaolong.com/docs/install)
 
-**1.** **修改Caddyfile,增加配置**
+**1.** **修改/etc/caddy/Caddyfile,增加配置**
 
 ```sh
 
