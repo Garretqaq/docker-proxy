@@ -190,14 +190,10 @@ type chunk struct {
 
 // 处理大文件传输的方法
 func (dp *dockerProxy) handleBlobRequest(w http.ResponseWriter, r *http.Request, upstreamHost string) {
-	// 检测客户端连接状态
 	ctx := r.Context()
-
-	// 创建一个可取消的context
 	downloadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// 监听客户端断开
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -213,7 +209,7 @@ func (dp *dockerProxy) handleBlobRequest(w http.ResponseWriter, r *http.Request,
 		upstreamURL += "?" + r.URL.RawQuery
 	}
 
-	// 先发送 HEAD 请求获取文件大小
+	// 获取文件大小
 	headReq, _ := http.NewRequestWithContext(downloadCtx, "HEAD", upstreamURL, nil)
 	headReq.Header = r.Header.Clone()
 	headReq.Header.Set("Host", upstreamHost)
@@ -232,25 +228,8 @@ func (dp *dockerProxy) handleBlobRequest(w http.ResponseWriter, r *http.Request,
 
 	contentLength := headResp.ContentLength
 	if contentLength <= 0 {
-		// 如果无法获取文件大小或文件太小，使用普通下载
 		dp.handleSimpleDownload(w, r, upstreamURL, upstreamHost)
 		return
-	}
-
-	// 计算分片
-	chunks := make([]chunk, 0)
-	var current int64 = 0
-	for current < contentLength {
-		end := current + defaultChunkSize
-		if end > contentLength {
-			end = contentLength
-		}
-		chunks = append(chunks, chunk{
-			start: current,
-			end:   end - 1,
-			index: len(chunks),
-		})
-		current = end
 	}
 
 	// 复制响应头
@@ -269,123 +248,81 @@ func (dp *dockerProxy) handleBlobRequest(w http.ResponseWriter, r *http.Request,
 	bufWriter := bufio.NewWriterSize(w, 512*1024) // 512KB buffer
 	defer bufWriter.Flush()
 
-	// 并发下载
-	errChan := make(chan error, len(chunks))
-	doneChan := make(chan struct{})
-	semaphore := make(chan struct{}, maxConcurrent)
-	dataChan := make(chan struct {
-		data  []byte
-		index int
-	}, len(chunks))
+	// 使用管道进行数据传输
+	pipeReader, pipeWriter := io.Pipe()
+	defer pipeWriter.Close()
 
 	// 启动下载协程
-	for _, c := range chunks {
-		select {
-		case <-downloadCtx.Done():
-			log.Printf("下载已取消")
-			return
-		default:
-			semaphore <- struct{}{} // 获取信号量
-			go func(c chunk) {
-				defer func() { <-semaphore }() // 释放信号量
-
-				select {
-				case <-downloadCtx.Done():
-					errChan <- fmt.Errorf("分片 %d 下载取消", c.index)
-					return
-				default:
-					var lastErr error
-					for retry := 0; retry < maxRetries; retry++ {
-						if retry > 0 {
-							log.Printf("分片 %d 重试 %d/%d", c.index, retry, maxRetries)
-							time.Sleep(retryDelay)
-						}
-
-						req, _ := http.NewRequestWithContext(downloadCtx, "GET", upstreamURL, nil)
-						req.Header = r.Header.Clone()
-						req.Header.Set("Host", upstreamHost)
-						req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", c.start, c.end))
-						req.Header.Set("Connection", "keep-alive")
-
-						resp, err := dp.client.Do(req)
-						if err != nil {
-							lastErr = err
-							if downloadCtx.Err() != nil {
-								errChan <- fmt.Errorf("分片 %d 下载取消", c.index)
-								return
-							}
-							continue
-						}
-
-						// 读取整个分片数据
-						data, err := io.ReadAll(resp.Body)
-						resp.Body.Close()
-
-						if err != nil {
-							lastErr = err
-							if downloadCtx.Err() != nil {
-								errChan <- fmt.Errorf("分片 %d 传输取消", c.index)
-								return
-							}
-							continue
-						}
-
-						// 发送数据到通道
-						dataChan <- struct {
-							data  []byte
-							index int
-						}{data: data, index: c.index}
-
-						errChan <- nil
-						return
-					}
-
-					if lastErr != nil {
-						errChan <- fmt.Errorf("分片 %d 下载失败(重试%d次): %v", c.index, maxRetries, lastErr)
-					}
-				}
-			}(c)
-		}
-	}
-
-	// 按顺序写入数据
 	go func() {
-		receivedChunks := make(map[int][]byte)
-		nextIndex := 0
-		receivedCount := 0
+		defer pipeReader.Close()
 
-		for receivedCount < len(chunks) {
+		// 分片下载
+		var current int64 = 0
+		for current < contentLength {
 			select {
 			case <-downloadCtx.Done():
 				return
-			case chunkData := <-dataChan:
-				receivedChunks[chunkData.index] = chunkData.data
-				receivedCount++
+			default:
+				end := current + defaultChunkSize
+				if end > contentLength {
+					end = contentLength
+				}
 
-				// 按顺序写入数据
-				for {
-					if data, ok := receivedChunks[nextIndex]; ok {
-						if _, err := bufWriter.Write(data); err != nil {
-							log.Printf("写入数据块 %d 失败: %v", nextIndex, err)
+				var lastErr error
+				for retry := 0; retry < maxRetries; retry++ {
+					if retry > 0 {
+						log.Printf("分片 %d-%d 重试 %d/%d", current, end, retry, maxRetries)
+						time.Sleep(retryDelay)
+					}
+
+					req, _ := http.NewRequestWithContext(downloadCtx, "GET", upstreamURL, nil)
+					req.Header = r.Header.Clone()
+					req.Header.Set("Host", upstreamHost)
+					req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", current, end-1))
+					req.Header.Set("Connection", "keep-alive")
+
+					resp, err := dp.client.Do(req)
+					if err != nil {
+						lastErr = err
+						if downloadCtx.Err() != nil {
 							return
 						}
-						delete(receivedChunks, nextIndex)
-						nextIndex++
-					} else {
-						break
+						continue
 					}
+
+					// 使用io.Copy直接传输数据到管道
+					_, err = io.Copy(pipeWriter, resp.Body)
+					resp.Body.Close()
+
+					if err != nil {
+						lastErr = err
+						if downloadCtx.Err() != nil {
+							return
+						}
+						continue
+					}
+
+					break
 				}
+
+				if lastErr != nil {
+					log.Printf("分片 %d-%d 下载失败(重试%d次): %v", current, end, maxRetries, lastErr)
+					return
+				}
+
+				current = end
 			}
 		}
-		close(doneChan)
 	}()
 
-	// 等待下载完成或取消
-	select {
-	case <-downloadCtx.Done():
-		log.Printf("下载已取消")
-		return
-	case <-doneChan:
+	// 从管道读取数据并写入响应
+	buf := make([]byte, 256*1024) // 256KB buffer
+	if _, err := io.CopyBuffer(bufWriter, pipeReader, buf); err != nil {
+		if downloadCtx.Err() != nil {
+			log.Printf("传输已取消: %v", err)
+			return
+		}
+		log.Printf("传输数据时发生错误: %v", err)
 	}
 }
 
