@@ -96,6 +96,12 @@ func (dp *dockerProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 获取上游地址
 	upstreamHost, isDefaultHub := routeByHosts(hostTop)
 
+	// 处理search请求
+	if strings.HasPrefix(r.URL.Path, "/v1/search") {
+		dp.handleSearchRequest(w, r)
+		return
+	}
+
 	// 处理token请求
 	if strings.Contains(r.URL.Path, "/token") {
 		dp.handleTokenRequest(w, r)
@@ -555,6 +561,48 @@ func (dp *dockerProxy) handleTokenRequest(w http.ResponseWriter, r *http.Request
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		log.Printf("复制响应体失败: %v", err)
 	}
+}
+
+// 处理搜索请求
+func (dp *dockerProxy) handleSearchRequest(w http.ResponseWriter, r *http.Request) {
+	upstream, err := url.Parse("https://index.docker.io")
+	if err != nil {
+		http.Error(w, "Failed to parse upstream URL", http.StatusInternalServerError)
+		return
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	proxy.Transport = dp.client.Transport
+
+	proxy.Director = func(req *http.Request) {
+		req.URL.Scheme = upstream.Scheme
+		req.URL.Host = upstream.Host
+		req.Host = upstream.Host
+
+		// 保持原始查询参数
+		req.URL.RawQuery = r.URL.RawQuery
+
+		// 设置必要的请求头
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", r.UserAgent())
+
+		// 复制认证头
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+
+		log.Printf("搜索请求转发到: %s%s?%s", req.Host, req.URL.Path, req.URL.RawQuery)
+	}
+
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		resp.Header.Set("Access-Control-Allow-Origin", "*")
+		resp.Header.Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		resp.Header.Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		resp.Header.Set("Content-Type", "application/json")
+		return nil
+	}
+
+	proxy.ServeHTTP(w, r)
 }
 
 func main() {
