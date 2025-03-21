@@ -403,6 +403,13 @@ func (dp *dockerProxy) handleWebRequest(w http.ResponseWriter, r *http.Request) 
 		req.URL.Host = upstream.Host
 		req.Host = upstream.Host
 
+		// 复制原始请求的 cookie
+		if cookies := r.Cookies(); len(cookies) > 0 {
+			for _, cookie := range cookies {
+				req.AddCookie(cookie)
+			}
+		}
+
 		req.Header.Set("Origin", "https://hub.docker.com")
 		req.Header.Set("Referer", "https://hub.docker.com/")
 		if req.Header.Get("Accept") == "" {
@@ -414,6 +421,7 @@ func (dp *dockerProxy) handleWebRequest(w http.ResponseWriter, r *http.Request) 
 		resp.Header.Set("Access-Control-Allow-Origin", "*")
 		resp.Header.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		resp.Header.Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		resp.Header.Set("Access-Control-Allow-Credentials", "true")
 		resp.Header.Set("X-Frame-Options", "SAMEORIGIN")
 		return nil
 	}
