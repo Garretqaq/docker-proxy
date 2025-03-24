@@ -42,9 +42,10 @@ var routes = map[string]string{
 
 // 根据主机名选择对应的上游地址
 func routeByHosts(host string) (string, bool) {
-	if upstream, ok := routes[host]; ok {
-		return upstream, false
-	}
+	// 先注释后面兼容
+	//if upstream, ok := routes[host]; ok {
+	//	return upstream, false
+	//}
 	return defaultHubHost, true
 }
 
