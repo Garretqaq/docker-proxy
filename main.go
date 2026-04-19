@@ -10,6 +10,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,43 @@ var routes = map[string]string{
 	"test":       "registry-1.docker.io",
 }
 
+// 1MB 缓冲池，用于 blob 流式传输和 ReverseProxy 内部拷贝
+var blobCopyPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 1<<20)
+		return &buf
+	},
+}
+
+// 实现 httputil.BufferPool 接口，给 ReverseProxy 使用
+type proxyBufPool struct{}
+
+func (proxyBufPool) Get() []byte  { return *blobCopyPool.Get().(*[]byte) }
+func (proxyBufPool) Put(b []byte) { blobCopyPool.Put(&b) }
+
+// hop-by-hop headers，转发请求时跳过
+var hopByHop = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true,
+	"Trailers":            true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+}
+
+func copyRequestHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		if hopByHop[k] {
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+}
+
 // 根据主机名前缀选择上游地址
 func routeByHosts(host string) (string, bool) {
 	if upstream, ok := routes[host]; ok {
@@ -44,7 +82,8 @@ func routeByHosts(host string) (string, bool) {
 
 type dockerProxy struct {
 	transport  *http.Transport
-	httpClient *http.Client
+	httpClient *http.Client // token 等小请求，带超时
+	blobClient *http.Client // blob 下载，无超时，自动跟随 CDN 重定向
 }
 
 type loggingResponseWriter struct {
@@ -147,7 +186,9 @@ func newDockerProxy() *dockerProxy {
 			Timeout:   15 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ForceAttemptHTTP2:     true,
+		// 禁用 HTTP/2：其每流 64KB 初始窗口在高延迟链路上严重限制大文件吞吐
+		// Go 1.24+ 规则：有自定义 DialContext 且 ForceAttemptHTTP2=false 时自动禁用 HTTP/2
+		ForceAttemptHTTP2: false,
 		MaxIdleConns:          4096,
 		MaxIdleConnsPerHost:   1024,
 		IdleConnTimeout:       120 * time.Second,
@@ -155,8 +196,8 @@ func newDockerProxy() *dockerProxy {
 		ExpectContinueTimeout: 1 * time.Second,
 		ResponseHeaderTimeout: 90 * time.Second,
 		DisableCompression:    true,
-		ReadBufferSize:        128 * 1024,
-		WriteBufferSize:       128 * 1024,
+		ReadBufferSize:        256 * 1024,
+		WriteBufferSize:       256 * 1024,
 	}
 
 	return &dockerProxy{
@@ -164,6 +205,20 @@ func newDockerProxy() *dockerProxy {
 		httpClient: &http.Client{
 			Timeout:   45 * time.Second,
 			Transport: transport,
+		},
+		blobClient: &http.Client{
+			Transport: transport,
+			// 无全局超时：blob 下载时间不可预测
+			// 默认 CheckRedirect 最多跟随 10 次重定向（跟随 CDN 307）
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) > 0 {
+					log.Printf("blob_redirect from=%s to=%s", via[len(via)-1].URL.Host, req.URL.Host)
+				}
+				if len(via) >= 10 {
+					return http.ErrUseLastResponse
+				}
+				return nil
+			},
 		},
 	}
 }
@@ -207,6 +262,13 @@ func (dp *dockerProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (dp *dockerProxy) handleRegistryRequest(w http.ResponseWriter, r *http.Request, upstreamHost string, isDefaultHub bool) {
 	_ = isDefaultHub
+
+	// blob GET/HEAD 单独处理：使用 blobClient 跟随 CDN 重定向 + 1MB 缓冲流式传输
+	if strings.Contains(r.URL.Path, "/blobs/") && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		dp.handleBlobRequest(w, r, upstreamHost)
+		return
+	}
+
 	start := time.Now()
 
 	upstream, err := url.Parse("https://" + upstreamHost)
@@ -218,6 +280,8 @@ func (dp *dockerProxy) handleRegistryRequest(w http.ResponseWriter, r *http.Requ
 	incomingHost := r.Host
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 	proxy.Transport = dp.transport
+	proxy.BufferPool = proxyBufPool{}
+	proxy.FlushInterval = -1 // 立即刷新，减少数据积压
 
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = upstream.Scheme
@@ -265,6 +329,55 @@ func (dp *dockerProxy) handleRegistryRequest(w http.ResponseWriter, r *http.Requ
 	dp.logRegistryRequest(r, upstreamHost, statusCode, logWriter.bytes, start)
 }
 
+// handleBlobRequest 直接用 blobClient 下载 blob，自动跟随 CDN 307 重定向，避免客户端绕过代理
+func (dp *dockerProxy) handleBlobRequest(w http.ResponseWriter, r *http.Request, upstreamHost string) {
+	start := time.Now()
+
+	targetURL := "https://" + upstreamHost + r.URL.RequestURI()
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	copyRequestHeaders(req.Header, r.Header)
+
+	resp, err := dp.blobClient.Do(req)
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		log.Printf("blob request error: %v", err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	h := w.Header()
+	for k, vs := range resp.Header {
+		if hopByHop[k] {
+			continue
+		}
+		for _, v := range vs {
+			h.Add(k, v)
+		}
+	}
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Expose-Headers", "*")
+
+	lw := newLoggingResponseWriter(w)
+	lw.WriteHeader(resp.StatusCode)
+
+	if r.Method != http.MethodHead {
+		buf := blobCopyPool.Get().(*[]byte)
+		defer blobCopyPool.Put(buf)
+		if _, err = io.CopyBuffer(lw, resp.Body, *buf); err != nil && r.Context().Err() == nil {
+			log.Printf("blob copy error: %v", err)
+		}
+	}
+
+	dp.logRegistryRequest(r, upstreamHost, lw.statusCode, lw.bytes, start)
+}
+
 func (dp *dockerProxy) handleWebRequest(w http.ResponseWriter, r *http.Request) {
 	upstream, err := url.Parse("https://hub.docker.com")
 	if err != nil {
@@ -274,6 +387,8 @@ func (dp *dockerProxy) handleWebRequest(w http.ResponseWriter, r *http.Request) 
 
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 	proxy.Transport = dp.transport
+	proxy.BufferPool = proxyBufPool{}
+	proxy.FlushInterval = -1
 
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = upstream.Scheme
@@ -314,6 +429,8 @@ func (dp *dockerProxy) handleDefaultRequest(w http.ResponseWriter, r *http.Reque
 
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 	proxy.Transport = dp.transport
+	proxy.BufferPool = proxyBufPool{}
+	proxy.FlushInterval = -1
 
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = upstream.Scheme
@@ -433,6 +550,8 @@ func (dp *dockerProxy) handleSearchRequest(w http.ResponseWriter, r *http.Reques
 
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 	proxy.Transport = dp.transport
+	proxy.BufferPool = proxyBufPool{}
+	proxy.FlushInterval = -1
 
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = upstream.Scheme
