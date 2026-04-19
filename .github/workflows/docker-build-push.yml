@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REGISTRY: docker.io
-      IMAGE_NAME: songguangzhi/docker-proxy
+      IMAGE_NAME: songguangzhi/clash-for-docker
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
