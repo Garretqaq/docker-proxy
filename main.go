@@ -218,7 +218,6 @@ func (dp *dockerProxy) handleRegistryRequest(w http.ResponseWriter, r *http.Requ
 	incomingHost := r.Host
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 	proxy.Transport = dp.transport
-	proxy.FlushInterval = 200 * time.Millisecond
 
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = upstream.Scheme
