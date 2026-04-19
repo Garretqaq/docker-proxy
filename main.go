@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
@@ -44,6 +45,99 @@ func routeByHosts(host string) (string, bool) {
 type dockerProxy struct {
 	transport  *http.Transport
 	httpClient *http.Client
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	bytes      int64
+}
+
+func newLoggingResponseWriter(w http.ResponseWriter) *loggingResponseWriter {
+	return &loggingResponseWriter{ResponseWriter: w}
+}
+
+func (lw *loggingResponseWriter) WriteHeader(statusCode int) {
+	if lw.statusCode == 0 {
+		lw.statusCode = statusCode
+	}
+	lw.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (lw *loggingResponseWriter) Write(p []byte) (int, error) {
+	if lw.statusCode == 0 {
+		lw.statusCode = http.StatusOK
+	}
+	n, err := lw.ResponseWriter.Write(p)
+	lw.bytes += int64(n)
+	return n, err
+}
+
+func (lw *loggingResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	if lw.statusCode == 0 {
+		lw.statusCode = http.StatusOK
+	}
+	if rf, ok := lw.ResponseWriter.(io.ReaderFrom); ok {
+		n, err := rf.ReadFrom(r)
+		lw.bytes += n
+		return n, err
+	}
+	n, err := io.Copy(lw.ResponseWriter, r)
+	lw.bytes += n
+	return n, err
+}
+
+func (lw *loggingResponseWriter) Flush() {
+	if flusher, ok := lw.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (lw *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := lw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, http.ErrNotSupported
+	}
+	return hijacker.Hijack()
+}
+
+func (lw *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return lw.ResponseWriter
+}
+
+func registryRequestType(path string) string {
+	switch {
+	case strings.Contains(path, "/blobs/"):
+		return "blob"
+	case strings.Contains(path, "/manifests/"):
+		return "manifest"
+	case path == "/v2/" || path == "/v2":
+		return "ping"
+	default:
+		return "other"
+	}
+}
+
+func (dp *dockerProxy) logRegistryRequest(r *http.Request, upstreamHost string, statusCode int, bytes int64, start time.Time) {
+	elapsed := time.Since(start)
+	if elapsed <= 0 {
+		elapsed = time.Nanosecond
+	}
+	mb := float64(bytes) / (1024 * 1024)
+	speed := mb / elapsed.Seconds()
+	log.Printf(
+		"registry_request method=%s host=%s upstream=%s path=%s type=%s status=%d bytes=%d duration_ms=%d speed_mb_s=%.2f range=%q",
+		r.Method,
+		r.Host,
+		upstreamHost,
+		r.URL.Path,
+		registryRequestType(r.URL.Path),
+		statusCode,
+		bytes,
+		elapsed.Milliseconds(),
+		speed,
+		r.Header.Get("Range"),
+	)
 }
 
 func newDockerProxy() *dockerProxy {
@@ -113,6 +207,7 @@ func (dp *dockerProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (dp *dockerProxy) handleRegistryRequest(w http.ResponseWriter, r *http.Request, upstreamHost string, isDefaultHub bool) {
 	_ = isDefaultHub
+	start := time.Now()
 
 	upstream, err := url.Parse("https://" + upstreamHost)
 	if err != nil {
@@ -157,7 +252,18 @@ func (dp *dockerProxy) handleRegistryRequest(w http.ResponseWriter, r *http.Requ
 		http.Error(w, err.Error(), http.StatusBadGateway)
 	}
 
-	proxy.ServeHTTP(w, r)
+	logWriter := newLoggingResponseWriter(w)
+	proxy.ServeHTTP(logWriter, r)
+
+	statusCode := logWriter.statusCode
+	if statusCode == 0 {
+		if r.Context().Err() != nil {
+			statusCode = 499
+		} else {
+			statusCode = http.StatusOK
+		}
+	}
+	dp.logRegistryRequest(r, upstreamHost, statusCode, logWriter.bytes, start)
 }
 
 func (dp *dockerProxy) handleWebRequest(w http.ResponseWriter, r *http.Request) {
@@ -257,6 +363,7 @@ Commercial support is available at
 
 // 处理token请求
 func (dp *dockerProxy) handleTokenRequest(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	q := r.URL.Query()
 	scope := q.Get("scope")
 	service := q.Get("service")
@@ -310,9 +417,11 @@ func (dp *dockerProxy) handleTokenRequest(w http.ResponseWriter, r *http.Request
 
 	w.WriteHeader(resp.StatusCode)
 
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	n, err := io.Copy(w, resp.Body)
+	if err != nil {
 		log.Printf("Copy token response body failed: %v", err)
 	}
+	log.Printf("token_request status=%d bytes=%d duration_ms=%d scope=%q", resp.StatusCode, n, time.Since(start).Milliseconds(), q.Get("scope"))
 }
 
 // 处理搜索请求
